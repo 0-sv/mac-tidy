@@ -1,0 +1,372 @@
+#!/bin/bash
+# mac-tidy — reclaim RAM by stopping leaked dev daemons and idle helpers.
+# Dry run by default. See --help.
+
+set -uo pipefail
+
+DO_KILL=0; DO_APPS=0; DO_CHROME=0; DO_CLAUDE=0; DO_PURGE=0; VERBOSE=0
+TUNNEL_AGE_MIN=90     # aws ssm port-forwards older than this are considered stale
+SPARE_AGE_MIN=${MAC_TIDY_SPARE_AGE_MIN:-120}   # idle claude bg sessions older than this
+DEV_IDLE_MIN=180      # orphan-ish dev servers older than this
+
+usage() {
+  cat <<'USAGE'
+mac-tidy — stop leaked background processes and free RAM
+
+  mac-tidy                report only, change nothing (default)
+  mac-tidy --go           stop tier-1 stale dev daemons (safe)
+  mac-tidy --apps         also gracefully quit idle RAM-hog GUI apps
+  mac-tidy --chrome       also restart Chrome (session is restored, tabs unloaded)
+  mac-tidy --claude       also stop idle claude background sessions
+  mac-tidy --all          --go --apps --chrome --claude
+  mac-tidy --purge        run `sudo purge` at the end (prompts for password)
+  mac-tidy -v             show every pid considered
+
+Tiers beyond the first still need --go. Nothing outside your own uid is ever touched,
+and the session running this script is always protected.
+USAGE
+}
+
+for a in "$@"; do
+  case "$a" in
+    --go) DO_KILL=1 ;;
+    --apps) DO_APPS=1 ;;
+    --chrome) DO_CHROME=1 ;;
+    --claude) DO_CLAUDE=1 ;;
+    --all) DO_KILL=1; DO_APPS=1; DO_CHROME=1; DO_CLAUDE=1 ;;
+    --purge) DO_PURGE=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown flag: $a" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+ME=$$
+UID_NOW=$(id -u)
+bold() { printf '\033[1m%s\033[0m\n' "$1"; }
+dim()  { printf '\033[2m%s\033[0m\n' "$1"; }
+
+# ---------- helpers ----------
+
+# etime (MM:SS | HH:MM:SS | D-HH:MM:SS) -> seconds
+etime_secs() {
+  local e="$1" d=0 h=0 m=0 s=0
+  case "$e" in
+    *-*) d="${e%%-*}"; e="${e#*-}" ;;
+  esac
+  local n; n=$(echo "$e" | awk -F: '{print NF}')
+  if [ "$n" = 3 ]; then IFS=: read -r h m s <<<"$e"; else IFS=: read -r m s <<<"$e"; fi
+  echo $(( 10#${d:-0}*86400 + 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${s:-0} ))
+}
+
+age_min() {
+  local e; e=$(ps -p "$1" -o etime= 2>/dev/null | tr -d ' ')
+  [ -z "$e" ] && { echo 0; return; }
+  echo $(( $(etime_secs "$e") / 60 ))
+}
+
+rss_mb()  { local r; r=$(ps -p "$1" -o rss= 2>/dev/null | tr -d ' '); echo $(( ${r:-0} / 1024 )); }
+cpu_pct() { ps -p "$1" -o pcpu= 2>/dev/null | tr -d ' ' | cut -d. -f1; }
+owner()   { ps -p "$1" -o uid= 2>/dev/null | tr -d ' '; }
+cmdline() { ps -p "$1" -o args= 2>/dev/null | cut -c1-110; }
+
+descendants() {
+  local p="$1" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do echo "$c"; descendants "$c"; done
+}
+
+# Protect this script's whole session tree plus the claude daemon.
+PROTECTED=" $ME "
+p=$ME
+while [ -n "$p" ] && [ "$p" != 1 ]; do
+  PROTECTED="$PROTECTED $p "
+  case "$(ps -p "$p" -o comm= 2>/dev/null)" in
+    *"claude bg-spare"*) MY_SPARE=$p ;;
+  esac
+  p=$(ps -p "$p" -o ppid= 2>/dev/null | tr -d ' ')
+done
+for d in $(pgrep -f 'claude daemon run' 2>/dev/null); do PROTECTED="$PROTECTED $d "; done
+if [ -n "${MY_SPARE:-}" ]; then
+  for d in $(descendants "$MY_SPARE"); do PROTECTED="$PROTECTED $d "; done
+fi
+
+protected() { case "$PROTECTED" in *" $1 "*) return 0 ;; esac; return 1; }
+
+TMPF=$(mktemp -t mac-tidy)
+trap 'rm -f "$TMPF"' EXIT
+
+TARGETS=""; TOTAL_MB=0; N_TARGETS=0
+GROUP_MB=0; GROUP_N=0
+
+# add <pid> <reason>
+add() {
+  local pid="$1" why="$2" mb
+  [ -z "$pid" ] && return
+  ps -p "$pid" >/dev/null 2>&1 || return
+  protected "$pid" && { [ "$VERBOSE" = 1 ] && dim "    skip $pid (this session)"; return; }
+  [ "$(owner "$pid")" = "$UID_NOW" ] || { [ "$VERBOSE" = 1 ] && dim "    skip $pid (not yours)"; return; }
+  case " $TARGETS " in *" $pid "*) return ;; esac
+  mb=$(rss_mb "$pid")
+  TARGETS="$TARGETS $pid"
+  TOTAL_MB=$((TOTAL_MB + mb)); N_TARGETS=$((N_TARGETS + 1))
+  GROUP_MB=$((GROUP_MB + mb)); GROUP_N=$((GROUP_N + 1))
+  printf '    %-7s %5s MB  %s\n' "$pid" "$mb" "$why"
+}
+
+group() { GROUP_MB=0; GROUP_N=0; bold "  $1"; }
+group_end() {
+  [ "$GROUP_N" = 0 ] && dim "    nothing to do"
+  [ "$GROUP_N" -gt 0 ] && dim "    → $GROUP_N procs, ~${GROUP_MB} MB"
+  GROUP_N=0
+}
+
+mem_snapshot() {
+  local ps_out swap used total pct
+  ps_out=$(top -l 1 -n 0 2>/dev/null | grep -E 'PhysMem|Load Avg')
+  swap=$(sysctl -n vm.swapusage 2>/dev/null)
+  echo "$ps_out"
+  echo "Swap: $swap"
+  used=$(echo "$swap" | grep -oE 'used = [0-9.]+' | grep -oE '[0-9.]+' | cut -d. -f1)
+  total=$(echo "$swap" | grep -oE 'total = [0-9.]+' | grep -oE '[0-9.]+' | cut -d. -f1)
+  if [ -n "${used:-}" ] && [ -n "${total:-}" ] && [ "${total:-0}" -gt 0 ]; then
+    pct=$(( used * 100 / total ))
+    [ "$pct" -ge 75 ] && printf '\033[33m  swap is %s%% full — this is what makes the load average spike; free RAM, not CPU\033[0m\n' "$pct"
+  fi
+  echo "Procs: $(ps -Ao pid | wc -l | tr -d ' ')"
+}
+
+# ---------- report ----------
+
+bold "=== before ==="
+mem_snapshot
+echo
+bold "=== candidates ==="
+
+# 1. biome/tsserver LSP leak — advisory: VS Code's extension host respawns these
+#    instantly, so killing them is churn. Reloading the window is the real fix.
+group "editor LSP leak (advisory)"
+BIOME_N=$(pgrep -f 'biome lsp-proxy' 2>/dev/null | grep -c .)
+BIOME_MB=$(ps -Ao rss,args | grep 'biome lsp-proxy' | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+if [ "${BIOME_N:-0}" -gt 3 ]; then
+  dim "    $BIOME_N biome lsp-proxy procs, ~${BIOME_MB} MB — VS Code respawns these on kill."
+  dim "    Fix properly: cmd+shift+P → Developer: Reload Window"
+  GROUP_N=-1
+fi
+
+# 2. orphaned MCP servers (parent claude session is gone -> reparented to launchd)
+group "orphaned MCP servers"
+for pid in $(pgrep -f 'apple_mail_mcp.py|whatsapp-mcp-server|mcp-server' 2>/dev/null); do
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [ "$ppid" = 1 ] && add "$pid" "orphaned MCP server: $(cmdline "$pid" | cut -c1-60)"
+done
+group_end
+
+# 3. stale aws ssm port-forward tunnels with no live connection
+group "stale aws ssm db tunnels (>${TUNNEL_AGE_MIN}m, idle)"
+for pid in $(pgrep -f 'ssm start-session|session-manager-plugin' 2>/dev/null); do
+  a=$(age_min "$pid"); [ "$a" -lt "$TUNNEL_AGE_MIN" ] && continue
+  port=$(ps -p "$pid" -o args= 2>/dev/null | grep -oE 'localPortNumber[^0-9]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
+  if [ -n "$port" ] && lsof -nP -iTCP:"$port" -sTCP:ESTABLISHED >/dev/null 2>&1; then
+    dim "    keep $pid (port $port has a live connection)"; continue
+  fi
+  add "$pid" "ssm tunnel ${port:-?} idle ${a}m"
+done
+group_end
+
+# 4. orphaned JS dev servers / test runners
+group "orphaned dev servers & test runners"
+for pid in $(pgrep -f 'expo start|react-native start|metro|jest --|vitest|turbo run|tsc --watch|next dev|vite' 2>/dev/null); do
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  a=$(age_min "$pid"); c=$(cpu_pct "$pid")
+  if [ "$ppid" = 1 ]; then
+    add "$pid" "orphaned: $(cmdline "$pid" | cut -c1-60)"
+  elif ! ps -p "$ppid" >/dev/null 2>&1; then
+    add "$pid" "dead parent: $(cmdline "$pid" | cut -c1-60)"
+  elif [ "$a" -gt "$DEV_IDLE_MIN" ] && [ "${c:-0}" -lt 1 ]; then
+    dim "    keep $pid (idle ${a}m but still attached: $(cmdline "$pid" | cut -c1-50))"
+  fi
+done
+group_end
+
+# 5. JVM / android daemons with nothing to serve
+group "idle build & device daemons"
+for pid in $(pgrep -f 'GradleDaemon|KotlinCompileDaemon|GradleWrapperMain' 2>/dev/null); do
+  add "$pid" "gradle/kotlin daemon ($(age_min "$pid")m old)"
+done
+for pid in $(pgrep -x adb 2>/dev/null); do
+  if [ -z "$(adb devices 2>/dev/null | sed -n '2,$p' | grep -c device)" ] || \
+     [ "$(adb devices 2>/dev/null | sed -n '2,$p' | grep -c 'device$')" = 0 ]; then
+    add "$pid" "adb server, no devices attached"
+  else
+    dim "    keep adb $pid (device attached)"
+  fi
+done
+if ! xcrun simctl list devices booted 2>/dev/null | grep -q Booted; then
+  for pid in $(pgrep -f CoreSimulatorService 2>/dev/null); do
+    a=$(age_min "$pid")
+    [ "$a" -lt 120 ] && { dim "    keep $pid (CoreSimulatorService only ${a}m old — it respawns on demand)"; continue; }
+    add "$pid" "CoreSimulatorService, no booted simulator (${a}m)"
+  done
+fi
+group_end
+
+# 6. watchman (restarts itself, drops stale file watches)
+group "watchman (only when bloated — a kill forces a full re-crawl)"
+for pid in $(pgrep -x watchman 2>/dev/null); do
+  a=$(age_min "$pid"); mb=$(rss_mb "$pid")
+  if [ "$mb" -gt 800 ] && [ "$a" -gt 120 ]; then
+    add "$pid" "watchman bloated to ${mb} MB (${a}m old)"
+  else
+    dim "    keep $pid (${mb} MB, ${a}m old — re-crawling your project tree costs more than it frees)"
+    GROUP_N=-1
+  fi
+done
+group_end
+
+# 7. detached shells with no children
+group "detached shells"
+for pid in $(pgrep -x zsh 2>/dev/null; pgrep -x bash 2>/dev/null); do
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [ "$ppid" != 1 ] && continue
+  [ -n "$(pgrep -P "$pid" 2>/dev/null)" ] && continue
+  [ "$(age_min "$pid")" -lt 60 ] && continue
+  add "$pid" "orphaned shell ($(age_min "$pid")m, no children)"
+done
+group_end
+
+TIER1_TARGETS="$TARGETS"; TIER1_MB=$TOTAL_MB; TIER1_N=$N_TARGETS
+
+# 8. idle claude background sessions (opt-in)
+CLAUDE_TARGETS=""; CLAUDE_MB=0
+group "idle claude background sessions${DO_CLAUDE:+ }$([ "$DO_CLAUDE" = 1 ] && echo '' || echo '(needs --claude)')"
+SAVED_TARGETS="$TARGETS"; SAVED_MB=$TOTAL_MB; SAVED_N=$N_TARGETS
+GROUP_MB=0; GROUP_N=0
+for pid in $(pgrep -f 'claude bg-spare' 2>/dev/null); do
+  protected "$pid" && continue
+  a=$(age_min "$pid"); [ "$a" -lt "$SPARE_AGE_MIN" ] && continue
+  # a session actively running a job holds a caffeinate descendant
+  busy=0
+  for d in $(descendants "$pid"); do
+    case "$(ps -p "$d" -o comm= 2>/dev/null)" in *caffeinate*) busy=1 ;; esac
+  done
+  [ "$busy" = 1 ] && { dim "    keep $pid (job running)"; continue; }
+  add "$pid" "idle bg session, ${a}m old"
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  case "$(ps -p "$ppid" -o comm= 2>/dev/null)" in
+    *bg-pty-host*) add "$ppid" "  its pty host" ;;
+  esac
+done
+group_end
+if [ "$DO_CLAUDE" = 1 ]; then
+  CLAUDE_TARGETS=$(echo "$TARGETS" | tr ' ' '\n' | grep -vxF -f <(echo "$SAVED_TARGETS" | tr ' ' '\n' | grep -v '^$') 2>/dev/null | tr '\n' ' ')
+else
+  CLAUDE_TARGETS=""
+  TARGETS="$SAVED_TARGETS"; TOTAL_MB=$SAVED_MB; N_TARGETS=$SAVED_N
+fi
+
+# 9. RAM-hog GUI apps (opt-in, graceful quit)
+APP_LIST="${MAC_TIDY_APPS:-Figma Slack Spotify ChatGPT}"
+echo
+bold "  RAM-hog GUI apps$([ "$DO_APPS" = 1 ] && echo '' || echo ' (needs --apps)')"
+APPS_TO_QUIT=""
+for app in $APP_LIST; do
+  mb=$(ps -Ao rss,args | grep "/Applications/$app.app" | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+  [ -z "$mb" ] || [ "$mb" = 0 ] && continue
+  printf '    %-14s %5s MB\n' "$app" "$mb"
+  APPS_TO_QUIT="$APPS_TO_QUIT $app"
+done
+[ -z "$APPS_TO_QUIT" ] && dim "    none running"
+
+# 10. Chrome
+CHROME_MB=$(ps -Ao rss,args | grep '/Applications/Google Chrome.app' | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+CHROME_N=$(pgrep -f '/Applications/Google Chrome.app' 2>/dev/null | grep -c .)
+echo
+bold "  Chrome$([ "$DO_CHROME" = 1 ] && echo '' || echo ' (needs --chrome)')"
+if [ "${CHROME_MB:-0}" -gt 0 ]; then
+  printf '    %s procs, ~%s MB — restart reloads only the active tab per window\n' "$CHROME_N" "$CHROME_MB"
+else
+  dim "    not running"
+fi
+
+echo
+bold "=== biggest wins, ranked ==="
+{
+  printf '%s\t%s\t%s\n' "${CHROME_MB:-0}" "Chrome (${CHROME_N:-0} procs)" "--chrome  restart, session restored"
+  for app in $APPS_TO_QUIT; do
+    mb=$(ps -Ao rss,args | grep "/Applications/$app.app" | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+    printf '%s\t%s\t%s\n' "${mb:-0}" "$app" "--apps    graceful quit"
+  done
+  cl_mb=0; for pid in $(pgrep -f 'claude bg-spare|claude bg-pty-host' 2>/dev/null); do
+    protected "$pid" && continue
+    [ "$(age_min "$pid")" -lt "$SPARE_AGE_MIN" ] && continue
+    cl_mb=$((cl_mb + $(rss_mb "$pid")))
+  done
+  printf '%s\t%s\t%s\n' "$cl_mb" "idle claude bg sessions" "--claude  see caveat below"
+  printf '%s\t%s\t%s\n' "$TIER1_MB" "stale dev daemons ($TIER1_N procs)" "--go      always safe"
+} | sort -rn | awk -F'\t' '$1+0 > 0 {printf "  %6d MB  %-34s %s\n", $1, $2, $3}'
+
+echo
+bold "=== plan ==="
+printf '  tier 1 (dev daemons): %s procs, ~%s MB%s\n' "$TIER1_N" "$TIER1_MB" "$([ "$DO_KILL" = 1 ] && echo '  [will stop]' || echo '  [dry run]')"
+[ "$DO_CLAUDE" = 1 ] && printf '  claude bg sessions:   %s procs%s\n' "$(echo $CLAUDE_TARGETS | wc -w | tr -d ' ')" "$([ "$DO_KILL" = 1 ] && echo '  [will stop]' || echo '  [dry run]')"
+[ "$DO_APPS" = 1 ] && printf '  gui apps:            %s%s\n' "${APPS_TO_QUIT:- none}" "$([ "$DO_KILL" = 1 ] && echo '  [will quit]' || echo '  [dry run]')"
+[ "$DO_CHROME" = 1 ] && printf '  chrome:               restart%s\n' "$([ "$DO_KILL" = 1 ] && echo '  [will restart]' || echo '  [dry run]')"
+
+if [ "$DO_KILL" != 1 ]; then
+  echo
+  dim "Dry run — nothing was changed."
+  dim "  --go      stale dev daemons only (safe, reversible: they respawn)"
+  dim "  --chrome  biggest single win; Chrome reopens with tabs unloaded"
+  dim "  --apps    quits GUI apps gracefully, so unsaved work prompts first"
+  dim "  --claude  CAVEAT: a paused bg job you meant to resume would be lost."
+  dim "            Sessions actively running a job are always skipped."
+  dim "  --all     everything above"
+  exit 0
+fi
+
+# ---------- execute ----------
+
+stop_pid() {
+  local pid="$1"
+  ps -p "$pid" >/dev/null 2>&1 || return 0
+  protected "$pid" && return 0
+  kill -TERM "$pid" 2>/dev/null
+  local i=0
+  while [ $i -lt 6 ]; do
+    ps -p "$pid" >/dev/null 2>&1 || return 0
+    /bin/sleep 0.5; i=$((i+1))
+  done
+  kill -KILL "$pid" 2>/dev/null
+}
+
+echo
+bold "=== stopping ==="
+STOPPED=0
+for pid in $TARGETS $CLAUDE_TARGETS; do
+  [ -z "$pid" ] && continue
+  stop_pid "$pid" && STOPPED=$((STOPPED+1))
+done
+echo "  stopped $STOPPED processes"
+
+if [ "$DO_APPS" = 1 ] && [ -n "$APPS_TO_QUIT" ]; then
+  for app in $APPS_TO_QUIT; do
+    osascript -e "tell application \"$app\" to quit" >/dev/null 2>&1 \
+      && echo "  quit $app" || echo "  could not quit $app (left running)"
+  done
+fi
+
+if [ "$DO_CHROME" = 1 ] && [ "${CHROME_MB:-0}" -gt 0 ]; then
+  osascript -e 'tell application "Google Chrome" to quit' >/dev/null 2>&1
+  i=0; while pgrep -f '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' >/dev/null 2>&1 && [ $i -lt 20 ]; do /bin/sleep 0.5; i=$((i+1)); done
+  open -a "Google Chrome" >/dev/null 2>&1 && echo "  restarted Chrome (session restored)"
+fi
+
+if [ "$DO_PURGE" = 1 ]; then
+  echo "  running sudo purge…"
+  sudo purge && echo "  purge done"
+fi
+
+/bin/sleep 3
+echo
+bold "=== after ==="
+mem_snapshot
