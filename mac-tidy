@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-DO_KILL=0; DO_APPS=0; DO_CHROME=0; DO_CLAUDE=0; DO_PURGE=0; VERBOSE=0
+DO_KILL=0; DO_APPS=0; DO_CHROME=0; DO_CLAUDE=0; DO_SIMS=0; DO_PURGE=0; VERBOSE=0
 TUNNEL_AGE_MIN=90     # aws ssm port-forwards older than this are considered stale
 SPARE_AGE_MIN=${MAC_TIDY_SPARE_AGE_MIN:-120}   # idle claude bg sessions older than this
 DEV_IDLE_MIN=180      # orphan-ish dev servers older than this
@@ -18,7 +18,10 @@ mac-tidy — stop leaked background processes and free RAM
   mac-tidy --apps         also gracefully quit idle RAM-hog GUI apps
   mac-tidy --chrome       also restart Chrome (session is restored, tabs unloaded)
   mac-tidy --claude       also stop idle claude background sessions
-  mac-tidy --all          --go --apps --chrome --claude
+  mac-tidy --sims         also shut down booted iOS simulators + android emulators
+                          (graceful: sim state stays on disk, android saves its
+                          snapshot if quick-boot is enabled)
+  mac-tidy --all          --go --apps --chrome --claude --sims
   mac-tidy --purge        run `sudo purge` at the end (prompts for password)
   mac-tidy -v             show every pid considered
 
@@ -33,7 +36,8 @@ for a in "$@"; do
     --apps) DO_APPS=1 ;;
     --chrome) DO_CHROME=1 ;;
     --claude) DO_CLAUDE=1 ;;
-    --all) DO_KILL=1; DO_APPS=1; DO_CHROME=1; DO_CLAUDE=1 ;;
+    --sims) DO_SIMS=1 ;;
+    --all) DO_KILL=1; DO_APPS=1; DO_CHROME=1; DO_CLAUDE=1; DO_SIMS=1 ;;
     --purge) DO_PURGE=1 ;;
     -v|--verbose) VERBOSE=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -207,6 +211,9 @@ if ! xcrun simctl list devices booted 2>/dev/null | grep -q Booted; then
     [ "$a" -lt 120 ] && { dim "    keep $pid (CoreSimulatorService only ${a}m old — it respawns on demand)"; continue; }
     add "$pid" "CoreSimulatorService, no booted simulator (${a}m)"
   done
+  for pid in $(pgrep -x Simulator 2>/dev/null); do
+    add "$pid" "Simulator.app open with no booted simulator"
+  done
 fi
 group_end
 
@@ -264,7 +271,34 @@ else
   TARGETS="$SAVED_TARGETS"; TOTAL_MB=$SAVED_MB; N_TARGETS=$SAVED_N
 fi
 
-# 9. RAM-hog GUI apps (opt-in, graceful quit)
+# 9. booted iOS simulators & android emulators (opt-in, graceful shutdown)
+# Android matched by the sdk/emulator/ path, NOT qemu-system — colima/UTM/Docker
+# VMs are qemu too and must never be touched.
+IOS_BOOTED=$(xcrun simctl list devices booted 2>/dev/null | grep -c Booted | tr -d ' ')
+SIM_MB=$(ps -Ao rss,args | grep -E 'CoreSimulator|iPhoneSimulator|Simulator\.app' | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+EMU_SERIALS=$(adb devices 2>/dev/null | awk '/^emulator-/ {print $1}')
+EMU_PIDS=$(pgrep -f 'sdk/emulator/qemu' 2>/dev/null)
+EMU_MB=$(ps -Ao rss,args | grep -E 'sdk/emulator/' | grep -v grep | awk '{s+=$1} END {printf "%d", s/1024}')
+echo
+bold "  booted simulators & emulators$([ "$DO_SIMS" = 1 ] && echo '' || echo ' (needs --sims)')"
+if [ "${IOS_BOOTED:-0}" -gt 0 ]; then
+  printf '    %s booted iOS sim(s), ~%s MB — shutdown keeps apps & data on disk\n' "$IOS_BOOTED" "${SIM_MB:-0}"
+else
+  SIM_MB=0
+fi
+for s in $EMU_SERIALS; do
+  avd=$(adb -s "$s" emu avd name 2>/dev/null | head -1 | tr -d '\r')
+  printf '    android %s (%s)\n' "$s" "${avd:-avd name unknown}"
+done
+if [ -n "$EMU_PIDS" ]; then
+  printf '    android emulator procs ~%s MB — `emu kill` saves the quick-boot snapshot\n' "${EMU_MB:-0}"
+  [ -z "$EMU_SERIALS" ] && dim '    (running but not in adb devices — will TERM the qemu process directly)'
+else
+  EMU_MB=0
+fi
+[ "${IOS_BOOTED:-0}" = 0 ] && [ -z "$EMU_PIDS" ] && dim "    none running"
+
+# 10. RAM-hog GUI apps (opt-in, graceful quit)
 APP_LIST="${MAC_TIDY_APPS:-Figma Slack Spotify ChatGPT}"
 echo
 bold "  RAM-hog GUI apps$([ "$DO_APPS" = 1 ] && echo '' || echo ' (needs --apps)')"
@@ -302,6 +336,7 @@ bold "=== biggest wins, ranked ==="
     cl_mb=$((cl_mb + $(rss_mb "$pid")))
   done
   printf '%s\t%s\t%s\n' "$cl_mb" "idle claude bg sessions" "--claude  see caveat below"
+  printf '%s\t%s\t%s\n' "$(( ${SIM_MB:-0} + ${EMU_MB:-0} ))" "iOS sims + android emulators" "--sims    graceful shutdown"
   printf '%s\t%s\t%s\n' "$TIER1_MB" "stale dev daemons ($TIER1_N procs)" "--go      always safe"
 } | sort -rn | awk -F'\t' '$1+0 > 0 {printf "  %6d MB  %-34s %s\n", $1, $2, $3}'
 
@@ -309,6 +344,7 @@ echo
 bold "=== plan ==="
 printf '  tier 1 (dev daemons): %s procs, ~%s MB%s\n' "$TIER1_N" "$TIER1_MB" "$([ "$DO_KILL" = 1 ] && echo '  [will stop]' || echo '  [dry run]')"
 [ "$DO_CLAUDE" = 1 ] && printf '  claude bg sessions:   %s procs%s\n' "$(echo $CLAUDE_TARGETS | wc -w | tr -d ' ')" "$([ "$DO_KILL" = 1 ] && echo '  [will stop]' || echo '  [dry run]')"
+[ "$DO_SIMS" = 1 ] && printf '  sims/emulators:       %s iOS booted, %s android%s\n' "${IOS_BOOTED:-0}" "$(echo $EMU_PIDS | wc -w | tr -d ' ')" "$([ "$DO_KILL" = 1 ] && echo '  [will shut down]' || echo '  [dry run]')"
 [ "$DO_APPS" = 1 ] && printf '  gui apps:            %s%s\n' "${APPS_TO_QUIT:- none}" "$([ "$DO_KILL" = 1 ] && echo '  [will quit]' || echo '  [dry run]')"
 [ "$DO_CHROME" = 1 ] && printf '  chrome:               restart%s\n' "$([ "$DO_KILL" = 1 ] && echo '  [will restart]' || echo '  [dry run]')"
 
@@ -320,6 +356,8 @@ if [ "$DO_KILL" != 1 ]; then
   dim "  --apps    quits GUI apps gracefully, so unsaved work prompts first"
   dim "  --claude  CAVEAT: a paused bg job you meant to resume would be lost."
   dim "            Sessions actively running a job are always skipped."
+  dim "  --sims    shuts down booted iOS sims + android emulators gracefully;"
+  dim "            a test run in progress on one WILL be interrupted."
   dim "  --all     everything above"
   exit 0
 fi
@@ -347,6 +385,23 @@ for pid in $TARGETS $CLAUDE_TARGETS; do
   stop_pid "$pid" && STOPPED=$((STOPPED+1))
 done
 echo "  stopped $STOPPED processes"
+
+if [ "$DO_SIMS" = 1 ]; then
+  if [ "${IOS_BOOTED:-0}" -gt 0 ]; then
+    xcrun simctl shutdown all >/dev/null 2>&1 && echo "  shut down $IOS_BOOTED iOS simulator(s)"
+    osascript -e 'tell application "Simulator" to quit' >/dev/null 2>&1
+  fi
+  for s in $EMU_SERIALS; do
+    adb -s "$s" emu kill >/dev/null 2>&1 && echo "  asked android $s to shut down"
+  done
+  if [ -n "$EMU_PIDS" ]; then
+    i=0
+    while pgrep -f 'sdk/emulator/qemu' >/dev/null 2>&1 && [ $i -lt 30 ]; do /bin/sleep 0.5; i=$((i+1)); done
+    for pid in $(pgrep -f 'sdk/emulator/qemu' 2>/dev/null); do
+      stop_pid "$pid" && echo "  TERMed leftover emulator pid $pid"
+    done
+  fi
+fi
 
 if [ "$DO_APPS" = 1 ] && [ -n "$APPS_TO_QUIT" ]; then
   for app in $APPS_TO_QUIT; do

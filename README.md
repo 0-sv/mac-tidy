@@ -51,6 +51,7 @@ mac-tidy --go           stop tier-1 stale dev daemons (safe)
 mac-tidy --apps         also gracefully quit idle RAM-hog GUI apps
 mac-tidy --chrome       also restart Chrome (session restored, tabs unloaded)
 mac-tidy --claude       also stop idle Claude Code background sessions
+mac-tidy --sims         also shut down booted iOS simulators + Android emulators
 mac-tidy --all          everything above
 mac-tidy --purge        run `sudo purge` at the end
 mac-tidy -v             show every pid considered
@@ -67,6 +68,7 @@ Things that leaked and either respawn on demand or cost nothing to restart:
 - Gradle / Kotlin compile daemons
 - `adb` server when no device is attached
 - `CoreSimulatorService` when no simulator is booted and it is over 2h old
+- Simulator.app sitting open with no booted simulator
 - Detached shells with no children
 - `watchman`, but only if it has ballooned past 800MB
 
@@ -83,6 +85,18 @@ Override the app list with `MAC_TIDY_APPS="Figma Slack"`.
 Stops idle Claude Code background sessions. Sessions actively running a job are
 always skipped (they hold a `caffeinate` descendant). **Caveat:** a paused job you
 meant to resume would be lost.
+
+### Tier 4 — `--sims`
+
+Shuts down booted iOS simulators and running Android emulators, gracefully:
+`xcrun simctl shutdown all` plus quitting Simulator.app (sim apps and data stay
+on disk), and `adb emu kill` per emulator (saves the quick-boot snapshot), with
+a TERM fallback for a qemu process that adb has lost track of. A forgotten
+booted simulator easily holds 3-5GB.
+
+Android emulators are matched by their `sdk/emulator/` path, never by
+`qemu-system` — so colima, UTM, and Docker VMs (also qemu) are never touched.
+**Caveat:** a test run in progress on a sim or emulator will be interrupted.
 
 ## Safety
 
