@@ -25,7 +25,8 @@ mac-tidy — stop leaked background processes and free RAM
   mac-tidy --purge        run `sudo purge` at the end (prompts for password)
   mac-tidy -v             show every pid considered
 
-Tiers beyond the first still need --go. Nothing outside your own uid is ever touched,
+--apps/--chrome/--claude/--sims only SELECT what to clean; nothing runs without
+--go (e.g. `mac-tidy --sims --go`). Nothing outside your own uid is ever touched,
 and the session running this script is always protected.
 USAGE
 }
@@ -350,6 +351,15 @@ printf '  tier 1 (dev daemons): %s procs, ~%s MB%s\n' "$TIER1_N" "$TIER1_MB" "$(
 
 if [ "$DO_KILL" != 1 ]; then
   echo
+  if [ "$DO_APPS" = 1 ] || [ "$DO_CHROME" = 1 ] || [ "$DO_CLAUDE" = 1 ] || [ "$DO_SIMS" = 1 ]; then
+    printf '\033[33m  These flags only pick what to clean — nothing ran. Add --go to execute:\n'
+    printf '    mac-tidy%s%s%s%s --go\033[0m\n' \
+      "$([ "$DO_APPS" = 1 ] && echo ' --apps')" \
+      "$([ "$DO_CHROME" = 1 ] && echo ' --chrome')" \
+      "$([ "$DO_CLAUDE" = 1 ] && echo ' --claude')" \
+      "$([ "$DO_SIMS" = 1 ] && echo ' --sims')"
+    echo
+  fi
   dim "Dry run — nothing was changed."
   dim "  --go      stale dev daemons only (safe, reversible: they respawn)"
   dim "  --chrome  biggest single win; Chrome reopens with tabs unloaded"

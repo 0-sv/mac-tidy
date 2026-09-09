@@ -57,6 +57,9 @@ mac-tidy --purge        run `sudo purge` at the end
 mac-tidy -v             show every pid considered
 ```
 
+`--apps`, `--chrome`, `--claude`, and `--sims` only select what to clean — nothing
+runs without `--go` (e.g. `mac-tidy --sims --go`). `--all` includes `--go`.
+
 ### Tier 1 — `--go`, always safe
 
 Things that leaked and either respawn on demand or cost nothing to restart:
